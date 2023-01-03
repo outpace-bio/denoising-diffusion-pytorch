@@ -295,6 +295,7 @@ class Unet(nn.Module):
 
         block_klass = partial(ResnetBlock, groups = resnet_block_groups)
 
+        print('HELLLOO')
         # time embeddings
 
         time_dim = dim * 4
@@ -442,6 +443,8 @@ class GaussianDiffusion(nn.Module):
         model,
         *,
         image_size,
+        image_width, # Paul edit
+        normalize_to_neg_one_to_one, # Paul edit
         timesteps = 1000,
         sampling_timesteps = None,
         loss_type = 'l1',
@@ -450,7 +453,9 @@ class GaussianDiffusion(nn.Module):
         schedule_fn_kwargs = dict(),
         p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_k = 1,
-        ddim_sampling_eta = 0.
+        ddim_sampling_eta = 0.,
+        do_structure_loss = False, # Paul edit
+        esm_model = None # Paul edit
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
@@ -461,8 +466,12 @@ class GaussianDiffusion(nn.Module):
         self.self_condition = self.model.self_condition
 
         self.image_size = image_size
-
+        self.image_width = image_width # Paul edit
+        self.normalize_to_neg_one_to_one = normalize_to_neg_one_to_one # Paul edit
         self.objective = objective
+        
+        self.do_structure_loss = do_structure_loss # Paul edit
+        self.esm_model = esm_model # Paul edit
 
         assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
 
@@ -564,12 +573,12 @@ class GaussianDiffusion(nn.Module):
         model_output = self.model(x, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
-        if self.objective == 'pred_noise':
+        if self.objective == 'pred_noise': # Is this right?? Should it be pred_x0?
             pred_noise = model_output
             x_start = self.predict_start_from_noise(x, t, pred_noise)
             x_start = maybe_clip(x_start)
 
-        elif self.objective == 'pred_x0':
+        elif self.objective == 'pred_x0': # Is this right??
             x_start = model_output
             x_start = maybe_clip(x_start)
             pred_noise = self.predict_noise_from_start(x, t, x_start)
@@ -586,6 +595,7 @@ class GaussianDiffusion(nn.Module):
         preds = self.model_predictions(x, t, x_self_cond)
         x_start = preds.pred_x_start
 
+        clip_denoised = False # Paul edit. Clipping the denoised makes sense for -1, 1 norm but not for our data
         if clip_denoised:
             x_start.clamp_(-1., 1.)
 
@@ -613,8 +623,29 @@ class GaussianDiffusion(nn.Module):
             self_cond = x_start if self.self_condition else None
             img, x_start = self.p_sample(img, t, self_cond)
 
-        img = unnormalize_to_zero_to_one(img)
+        if self.normalize_to_neg_one_to_one: # Paul edit
+            img = unnormalize_to_zero_to_one(img)
         return img
+
+    ### Paul Edit ###
+    @torch.no_grad()
+    def p_sample_loop_with_step_saves(self, shape):
+        batch, device = shape[0], self.betas.device
+
+        img = torch.randn(shape, device=device)
+
+        x_start = None
+        saved_images = []
+        saved_images.append(img)
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
+            self_cond = x_start if self.self_condition else None
+            img, x_start = self.p_sample(img, t, self_cond)
+            saved_images.append(img.cpu())
+
+        if self.normalize_to_neg_one_to_one: # Paul edit
+            img = unnormalize_to_zero_to_one(img)
+        return saved_images
+    ### --------- ###
 
     @torch.no_grad()
     def ddim_sample(self, shape, clip_denoised = True):
@@ -648,15 +679,16 @@ class GaussianDiffusion(nn.Module):
             img = x_start * alpha_next.sqrt() + \
                   c * pred_noise + \
                   sigma * noise
-
-        img = unnormalize_to_zero_to_one(img)
+        if self.normalize_to_neg_one_to_one: # Paul edit
+            img = unnormalize_to_zero_to_one(img)
         return img
 
     @torch.no_grad()
     def sample(self, batch_size = 16):
         image_size, channels = self.image_size, self.channels
+        image_width = self.image_width # Paul edit
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, image_size, image_size))
+        return sample_fn((batch_size, channels, image_size, image_width)) # Paul edit
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -727,14 +759,21 @@ class GaussianDiffusion(nn.Module):
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
-        return loss.mean()
+        loss = loss.mean() # Paul edit
+
+        if self.do_structure_loss: # Paul edit
+            pass
+
+        return loss
 
     def forward(self, img, *args, **kwargs):
-        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
-        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        b, c, h, w, device, img_size, image_width, = *img.shape, img.device, self.image_size, self.image_width # Paul edit
+        assert h == img_size and w == image_width, f'height and width of image must be {img_size} and {image_width}' # Paul edit
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
-        img = normalize_to_neg_one_to_one(img)
+        
+        if self.normalize_to_neg_one_to_one: # Paul edit
+            img = normalize_to_neg_one_to_one(img)
+        
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
